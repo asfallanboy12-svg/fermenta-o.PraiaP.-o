@@ -1,28 +1,32 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
-const T_REF = 24;
+/** ========= PARÂMETROS GERAIS ========= **/
+const T_REF = 24;                  // temperatura de referência (°C)
+const K_TEMP_DEFAULT = 0.045;      // sensibilidade padrão à temperatura
+const MAX_BATCHES = 20;
 
-const defaultProducts = {
-  forma: { name: "Forma", ideal_ref_min: 45 },
-  sovado: { name: "Sovado", ideal_ref_min: 60 },
-  hamburguer: { name: "Hamburguer", ideal_ref_min: 30 },
-  hotdog: { name: "Hot dog", ideal_ref_min: 270 },
-  cara: { name: "Cara", ideal_ref_min: 50 },
-  minicara: { name: "Mini cara", ideal_ref_min: 45 }
+/** ========= DEFAULTS ========= **/
+const DEFAULT_PRODUCTS = {
+  forma:      { key: "forma",      name: "Forma",      ideal_ref_min: 45,  ferment_ref_pct: 2.0, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 },
+  sovado:     { key: "sovado",     name: "Sovado",     ideal_ref_min: 60,  ferment_ref_pct: 2.0, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 },
+  hamburguer: { key: "hamburguer", name: "Hamburguer", ideal_ref_min: 30,  ferment_ref_pct: 2.0, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 },
+  hotdog:     { key: "hotdog",     name: "Hot dog",    ideal_ref_min: 270, ferment_ref_pct: 3.6, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 },
+  cara:       { key: "cara",       name: "Cara",       ideal_ref_min: 50,  ferment_ref_pct: 2.0, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 },
+  minicara:   { key: "minicara",   name: "Mini cara",  ideal_ref_min: 45,  ferment_ref_pct: 2.0, k_temp: K_TEMP_DEFAULT, q10: 0,   alpha: 1.0, corr: 1.0 }
 };
 
-function timeToMinutes(t) {
-  const [h, m] = t.split(":").map(Number);
-  return h * 60 + m;
-}
-function minutesToTime(m) {
+/** ========= HELPERS ========= **/
+const timeToMinutes = (t) => {
+  const [h, m] = (t || "00:00").split(":").map(Number);
+  return (h * 60 + m) | 0;
+};
+const minutesToTime = (m) => {
   const hh = Math.floor(m / 60) % 24;
   const mm = Math.floor(m % 60);
   return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-}
-
-function buildTempSeries(schedule, simEnd, interval) {
+};
+const buildTempSeries = (schedule, simEnd, interval) => {
   const start = timeToMinutes("00:00");
   const end = timeToMinutes(simEnd);
   const entries = [];
@@ -34,121 +38,505 @@ function buildTempSeries(schedule, simEnd, interval) {
     entries.push({ time: minutesToTime(t), tmin: t, temp: Number(curr.temp) });
   }
   return entries;
+};
+
+// fator de temperatura (Arrhenius ou Q10)
+const rateFactor = (temp, p) => {
+  const T0 = T_REF;
+  const q10 = Number(p?.q10 ?? 0);
+  if (q10 && q10 > 0) {
+    // Q10: multiplica a cada +10 °C
+    return Math.pow(q10, (temp - T0) / 10);
+  }
+  const k = Number(p?.k_temp ?? K_TEMP_DEFAULT);
+  return Math.exp(k * (temp - T0));
+};
+
+// aceita "3,6" ou "3.6" e também números normais
+const toNumber = (v) => {
+  if (v === null || v === undefined) return NaN;
+  const s = String(v).replace(",", ".").trim();
+  if (s === "") return NaN;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+};
+
+/** ========= FUNÇÕES DE PLANEJAMENTO POR HORÁRIO-ALVO ========= **/
+// incremento (minutos equivalentes) para UM passo, dado produto/fermento/temperatura
+const eqIncrement = (intervalMin, temp, product, ferment_pct) => {
+  const temp_factor = rateFactor(temp, product);
+  const fermentRef  = Number(product?.ferment_ref_pct ?? 2.0);
+  const alpha       = Number(product?.alpha ?? 1.0);
+  const fpct        = Number(ferment_pct || fermentRef);
+  const ferment_factor = Math.pow(fpct / fermentRef, Math.max(alpha, 0));
+  // quanto mais quente/fermento, mais rápido (maior incremento)
+  return intervalMin * temp_factor * ferment_factor;
+};
+
+// soma eq-min em [tA, tB)
+function accumulateEqMinutesForRange(tA, tB, series, product, ferment_pct, intervalMin) {
+  let acc = 0;
+  for (const seg of series) {
+    const t = seg.tmin;
+    if (t >= tA && t < tB) {
+      acc += eqIncrement(intervalMin, seg.temp, product, ferment_pct);
+    }
+  }
+  return acc;
 }
 
-function rateFactor(temp, k = 0.045) {
-  return Math.exp(k * (temp - T_REF));
+// encontra o horário (min) em que o lote chega a 100%; se não chegar, retorna null
+function findFinishTime(startMin, series, product, ferment_pct, intervalMin) {
+  const ideal = Number(product?.ideal_ref_min ?? 60) * Number(product?.corr ?? 1);
+  let acc = 0;
+  for (const seg of series) {
+    if (seg.tmin < startMin) continue;
+    acc += eqIncrement(intervalMin, seg.temp, product, ferment_pct);
+    if (acc >= ideal) return seg.tmin;
+  }
+  return null;
 }
 
+// dado um alvo (tTarget), encontra melhor "Início" por busca binária
+function solveStartTimeForTarget(tTarget, series, product, ferment_pct, intervalMin) {
+  const ideal = Number(product?.ideal_ref_min ?? 60) * Number(product?.corr ?? 1);
+  let lo = 0;           // 00:00
+  let hi = tTarget;     // não pode começar depois do alvo
+  for (let i = 0; i < 25; i++) {
+    const mid = Math.floor((lo + hi) / 2);
+    const acc = accumulateEqMinutesForRange(mid, tTarget, series, product, ferment_pct, intervalMin);
+    if (acc >= ideal) lo = mid + 1;  // começou cedo demais: dá pra atrasar
+    else hi = mid - 1;                // começou tarde: precisa adiantar
+  }
+  return Math.max(0, Math.min(tTarget, hi));
+}
+
+// manter início fixo e resolver % de fermento p/ bater o alvo (modelo com alpha)
+function solveFermentPctForTarget(startMin, tTarget, series, product, intervalMin) {
+  const ideal      = Number(product?.ideal_ref_min ?? 60) * Number(product?.corr ?? 1);
+  const fermentRef = Number(product?.ferment_ref_pct ?? 2.0);
+  const alpha      = Number(product?.alpha ?? 1.0);
+
+  // acumula com fermento = fermentRef
+  const acc_ref = accumulateEqMinutesForRange(startMin, tTarget, series, product, fermentRef, intervalMin);
+  if (acc_ref <= 0) return fermentRef;
+
+  const F = ideal / acc_ref; // quanto precisa multiplicar
+  const needed = fermentRef * Math.pow(F, 1 / Math.max(alpha, 0.0001));
+
+  return Math.max(0.1, Math.round(needed * 100) / 100);
+}
+
+/** ========= APP ========= **/
 export default function App() {
-  const [batches, setBatches] = useState([
-    { id: 1, name: "Massa 1 - Forma", start: "00:00", productKey: "forma", ferment_pct: 2.0, ideal_ref_min: defaultProducts.forma.ideal_ref_min },
-    { id: 2, name: "Massa 2 - Hamburguer", start: "00:30", productKey: "hamburguer", ferment_pct: 2.0, ideal_ref_min: defaultProducts.hamburguer.ideal_ref_min },
-    { id: 3, name: "Massa 3 - Hot dog", start: "01:00", productKey: "hotdog", ferment_pct: 3.6, ideal_ref_min: defaultProducts.hotdog.ideal_ref_min },
-    { id: 4, name: "Massa 4 - Sovado", start: "01:30", productKey: "sovado", ferment_pct: 2.0, ideal_ref_min: defaultProducts.sovado.ideal_ref_min },
-    { id: 5, name: "Massa 5 - Cara", start: "02:00", productKey: "cara", ferment_pct: 2.0, ideal_ref_min: defaultProducts.cara.ideal_ref_min },
-    { id: 6, name: "Massa 6 - Mini cara", start: "02:30", productKey: "minicara", ferment_pct: 2.0, ideal_ref_min: defaultProducts.minicara.ideal_ref_min }
-  ]);
+  /** ---- Produtos (persistência) ---- **/
+  const [products, setProducts] = useState(() => {
+    const saved = localStorage.getItem("pp_products_v1");
+    if (saved) { try { return JSON.parse(saved); } catch {} }
+    return DEFAULT_PRODUCTS;
+  });
+  useEffect(() => {
+    localStorage.setItem("pp_products_v1", JSON.stringify(products));
+  }, [products]);
 
-  const [tempSchedule, setTempSchedule] = useState([
-    { time: "00:00", temp: 24 },
-    { time: "02:00", temp: 26 },
-    { time: "03:00", temp: 28 },
-    { time: "05:00", temp: 29 }
-  ]);
+  /** ---- Cronograma / Config (persistência) ---- **/
+  const [tempSchedule, setTempSchedule] = useState(() => {
+    const s = localStorage.getItem("pp_tempSchedule_v1");
+    return s ? JSON.parse(s) : [
+      { time: "00:00", temp: 24 },
+      { time: "02:00", temp: 26 },
+      { time: "03:00", temp: 28 },
+      { time: "05:00", temp: 29 }
+    ];
+  });
+  const [simEndTime, setSimEndTime] = useState(() => localStorage.getItem("pp_simEndTime_v1") || "06:00");
+  const [intervalMin, setIntervalMin] = useState(() => Number(localStorage.getItem("pp_intervalMin_v1") || 10));
+  useEffect(() => localStorage.setItem("pp_tempSchedule_v1", JSON.stringify(tempSchedule)), [tempSchedule]);
+  useEffect(() => localStorage.setItem("pp_simEndTime_v1", simEndTime), [simEndTime]);
+  useEffect(() => localStorage.setItem("pp_intervalMin_v1", String(intervalMin)), [intervalMin]);
 
-  const [simEndTime, setSimEndTime] = useState("06:00");
-  const [intervalMin, setIntervalMin] = useState(10);
+  /** ---- Lotes (persistência) ---- **/
+  const [batches, setBatches] = useState(() => {
+    const b = localStorage.getItem("pp_batches_v1");
+    if (b) { try { return JSON.parse(b); } catch {} }
+    return [
+      { id: 1, name: "Massa 1", start: "00:00", productKey: "forma",      ferment_pct: 2.0, target_ready: "" },
+      { id: 2, name: "Massa 2", start: "00:30", productKey: "hamburguer", ferment_pct: 2.0, target_ready: "" },
+      { id: 3, name: "Massa 3", start: "01:00", productKey: "hotdog",     ferment_pct: 3.6, target_ready: "" },
+      { id: 4, name: "Massa 4", start: "01:30", productKey: "sovado",     ferment_pct: 2.0, target_ready: "" },
+      { id: 5, name: "Massa 5", start: "02:00", productKey: "cara",       ferment_pct: 2.0, target_ready: "" },
+      { id: 6, name: "Massa 6", start: "02:30", productKey: "minicara",   ferment_pct: 2.0, target_ready: "" }
+    ];
+  });
 
-  const tempSeries = useMemo(() => buildTempSeries(tempSchedule, simEndTime, intervalMin), [tempSchedule, simEndTime, intervalMin]);
+  // deduplicar IDs antigos, 1x
+  useEffect(() => {
+    const ids = new Set();
+    let changed = false;
+    const fixed = batches.map(b => {
+      if (ids.has(b.id)) {
+        changed = true;
+        return { ...b, id: Date.now() + Math.random() };
+      }
+      ids.add(b.id);
+      return b;
+    });
+    if (changed) setBatches(fixed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => localStorage.setItem("pp_batches_v1", JSON.stringify(batches)), [batches]);
+
+  /** ---- Séries e resultados ---- **/
+  const tempSeries = useMemo(
+    () => buildTempSeries(tempSchedule, simEndTime, intervalMin),
+    [tempSchedule, simEndTime, intervalMin]
+  );
 
   const results = useMemo(() => {
-    const out = batches.map((b) => ({ ...b, accumulated_eq_min: 0 }));
+    const out = batches.map((b) => {
+      const p = products[b.productKey] || {};
+      return { ...b, accumulated_eq_min: 0, _p: p };
+    });
+
+    // acumula minutos equivalentes (modelo Q10/Arrhenius + alpha)
     for (const seg of tempSeries) {
       for (const b of out) {
         const startMin = timeToMinutes(b.start);
         if (seg.tmin >= startMin && seg.tmin < timeToMinutes(simEndTime)) {
-          const tf = rateFactor(seg.temp);
-          const fermentRef = b.ferment_ref_pct ?? (b.productKey === "hotdog" ? 3.6 : 2.0);
-          const ff = fermentRef / Number(b.ferment_pct || fermentRef);
-          const eq = (intervalMin) / tf * (1 / ff);
-          b.accumulated_eq_min += eq;
+          b.accumulated_eq_min += eqIncrement(intervalMin, seg.temp, b._p, b.ferment_pct);
         }
       }
     }
+
     for (const b of out) {
-      const ideal = Number(b.ideal_ref_min) || (defaultProducts[b.productKey] && defaultProducts[b.productKey].ideal_ref_min) || 60;
-      b.pct = Math.min(100, (b.accumulated_eq_min / ideal) * 100);
-      b.estimated_time_remaining_min = Math.max(0, Math.round(ideal - b.accumulated_eq_min));
+      const ideal = Number(b._p?.ideal_ref_min ?? 60);
+      const corr  = Number(b._p?.corr ?? 1.0);
+      const effectiveIdeal = ideal * corr;
+
+      b.pct = Math.min(100, (b.accumulated_eq_min / effectiveIdeal) * 100);
+      b.estimated_time_remaining_min = Math.max(0, Math.round(effectiveIdeal - b.accumulated_eq_min));
       b.accumulated_eq_min = Math.round(b.accumulated_eq_min * 10) / 10;
+
+      // previsão e erro vs alvo
+      b.predicted_finish_min = findFinishTime(timeToMinutes(b.start), tempSeries, b._p, b.ferment_pct, intervalMin);
+      if (typeof b.target_ready === "string" && b.target_ready.includes(":")) {
+        const tTarget = timeToMinutes(b.target_ready);
+        b.error_min = (b.predicted_finish_min == null) ? null : (b.predicted_finish_min - tTarget);
+      } else {
+        b.error_min = null;
+      }
     }
     return out;
-  }, [batches, tempSeries, simEndTime, intervalMin]);
+  }, [batches, tempSeries, simEndTime, intervalMin, products]);
+
+  /** ---- Handlers: Cronograma ---- **/
+  const addTempPoint = () => {
+    const last = tempSchedule[tempSchedule.length - 1] || { time: "00:00", temp: 24 };
+    const nextMin = Math.min(timeToMinutes(simEndTime), timeToMinutes(last.time) + 30);
+    const newPoint = { time: minutesToTime(nextMin), temp: last.temp };
+    setTempSchedule([...tempSchedule, newPoint]);
+  };
+  const removeTempPoint = (idx) => {
+    if (tempSchedule.length <= 1) return;
+    setTempSchedule(tempSchedule.filter((_, i) => i !== idx));
+  };
+
+  /** ---- Handlers: Lotes ---- **/
+  const addBatch = () => {
+    if (batches.length >= MAX_BATCHES) return;
+    const id = Date.now(); // ID único
+    const start = minutesToTime((batches.length) * 30);
+    setBatches([
+      ...batches,
+      { id, name: `Massa ${batches.length + 1}`, start, productKey: "forma", ferment_pct: 2.0, target_ready: "" }
+    ]);
+  };
+  const removeBatch = (id) => setBatches(batches.filter((b) => b.id !== id));
+  const updateBatch = (id, field, value) =>
+    setBatches((prev) => prev.map((b) => {
+      if (b.id !== id) return b;
+      if (field === "ferment_pct") {
+        const n = toNumber(value);
+        return { ...b, ferment_pct: Number.isNaN(n) ? (value === "" ? "" : b.ferment_pct) : n };
+      }
+      return { ...b, [field]: value };
+    }));
+
+  // ajustes automáticos por alvo
+  const adjustStartForTarget = (id) => {
+    const b = batches.find(x => x.id === id);
+    if (!b || !b.target_ready) return;
+    const p = products[b.productKey] || {};
+    const tTarget = timeToMinutes(b.target_ready);
+    const newStartMin = solveStartTimeForTarget(tTarget, tempSeries, p, b.ferment_pct, intervalMin);
+    updateBatch(id, "start", minutesToTime(newStartMin));
+  };
+  const adjustFermentForTarget = (id) => {
+    const b = batches.find(x => x.id === id);
+    if (!b || !b.target_ready) return;
+    const p = products[b.productKey] || {};
+    const startMin = timeToMinutes(b.start);
+    const tTarget = timeToMinutes(b.target_ready);
+    if (tTarget <= startMin) return;
+    const newPct = solveFermentPctForTarget(startMin, tTarget, tempSeries, p, intervalMin);
+    updateBatch(id, "ferment_pct", newPct);
+  };
+
+  /** ---- Handlers: Produtos ---- **/
+  const updateProductField = (key, field, value) => {
+    setProducts((prev) => {
+      const current = prev[key]?.[field];
+      let v = value;
+      if (["ideal_ref_min", "ferment_ref_pct", "k_temp", "corr", "q10", "alpha"].includes(field)) {
+        const n = toNumber(value);
+        if (!Number.isNaN(n)) v = n;
+        else if (value === "") v = "";
+        else v = current ?? "";
+      }
+      return { ...prev, [key]: { ...prev[key], [field]: v } };
+    });
+  };
+  const exportProducts = () => {
+    const blob = new Blob([JSON.stringify(products, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "produtos_praiapao.json"; a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importProducts = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { setProducts(JSON.parse(reader.result)); alert("Produtos importados com sucesso!"); }
+      catch { alert("Arquivo inválido."); }
+    };
+    reader.readAsText(file);
+  };
+
+  /** ---- UI ---- **/
+  const [tab, setTab] = useState("painel"); // "painel" | "produtos"
 
   return (
-    <div style={{ padding: 20, maxWidth: 1200, margin: '0 auto', color: '#e6eef8' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h1 style={{ margin: 0 }}>Praia Pão — Controle de Fermentação (demo)</h1>
-        <div style={{ fontSize: 12, color: '#9fb0c8' }}>Tema: Escuro • Horários em minutos</div>
+    <div style={{ padding: 20, maxWidth: 1240, margin: "0 auto", color: "#e6eef8", fontFamily: "Inter, Roboto, sans-serif" }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <h1 style={{ margin: 0 }}>Praia Pão — Controle de Fermentação</h1>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setTab("painel")} style={{ padding: "8px 12px", borderRadius: 6, border: 0, cursor: "pointer", background: tab==="painel" ? "#1f6feb" : "#2b3145", color: "#fff" }}>Painel</button>
+          <button onClick={() => setTab("produtos")} style={{ padding: "8px 12px", borderRadius: 6, border: 0, cursor: "pointer", background: tab==="produtos" ? "#1f6feb" : "#2b3145", color: "#fff" }}>Produtos</button>
+        </div>
       </div>
 
-      <div style={{ display: 'flex', gap: 16 }}>
-        <div style={{ flex: '0 0 340px' }} className="card">
-          <div style={{ marginBottom: 8 }}><strong>Configurações</strong></div>
-          <div className="small">Fim da simulação</div>
-          <input value={simEndTime} onChange={(e) => setSimEndTime(e.target.value)} style={{ width: '100%', padding: 8, marginTop: 6 }} />
-          <div className="small" style={{ marginTop: 8 }}>Resolução (min)</div>
-          <input value={intervalMin} onChange={(e) => setIntervalMin(Number(e.target.value))} style={{ width: '100%', padding: 8, marginTop: 6 }} />
+      {tab === "painel" && (
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          {/* Configurações */}
+          <div style={{ flex: "0 0 360px", background: "#0f1724", borderRadius: 10, padding: 12, boxShadow: "0 6px 18px rgba(2,6,23,0.6)" }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Configurações</div>
+            <div style={{ fontSize: 13, color: "#9fb0c8" }}>Fim da simulação</div>
+            <input value={simEndTime} onChange={(e) => setSimEndTime(e.target.value)} style={{ width: "100%", padding: 8, margin: "6px 0 10px 0" }} />
+            <div style={{ fontSize: 13, color: "#9fb0c8" }}>Resolução (min)</div>
+            <input value={intervalMin} onChange={(e) => setIntervalMin(Number(e.target.value))} style={{ width: "100%", padding: 8, marginTop: 6 }} />
 
-          <div style={{ marginTop: 12 }}>
-            <div style={{ fontWeight: '600', marginBottom: 6 }}>Cronograma de Temperatura</div>
-            {tempSchedule.map((s, idx) => (
-              <div key={idx} style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
-                <input value={s.time} onChange={(e) => { const t = [...tempSchedule]; t[idx].time = e.target.value; setTempSchedule(t); }} style={{ width: 80, padding: 6 }} />
-                <input value={s.temp} onChange={(e) => { const t = [...tempSchedule]; t[idx].temp = Number(e.target.value); setTempSchedule(t); }} style={{ width: 80, padding: 6 }} />
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div style={{ flex: 1 }} className="card">
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-            <div style={{ fontWeight: 600 }}>Lotes</div>
-            <div style={{ color: '#9fb0c8', fontSize: 12 }}>Até 20 massas</div>
-          </div>
-          <table className="table">
-            <thead>
-              <tr><th>Nome</th><th>Início</th><th>% Fermento</th><th>Ref (min)</th><th>%</th><th>Restante (min)</th></tr>
-            </thead>
-            <tbody>
-              {results.map(r => (
-                <tr key={r.id}>
-                  <td>{r.name}</td>
-                  <td><input value={r.start} onChange={(e) => { setBatches(prev => prev.map(b => b.id === r.id ? { ...b, start: e.target.value } : b)); }} style={{ width: 70, padding: 6 }} /></td>
-                  <td><input value={r.ferment_pct} onChange={(e) => { setBatches(prev => prev.map(b => b.id === r.id ? { ...b, ferment_pct: e.target.value } : b)); }} style={{ width: 70, padding: 6 }} /></td>
-                  <td><input value={r.ideal_ref_min} onChange={(e) => { setBatches(prev => prev.map(b => b.id === r.id ? { ...b, ideal_ref_min: e.target.value } : b)); }} style={{ width: 70, padding: 6 }} /></td>
-                  <td>{r.pct.toFixed(1)}%</td>
-                  <td>{r.estimated_time_remaining_min}</td>
-                </tr>
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Cronograma de Temperatura</div>
+              {tempSchedule.map((s, idx) => (
+                <div key={idx} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                  <input
+                    value={s.time}
+                    onChange={(e) => { const t = [...tempSchedule]; t[idx].time = e.target.value; setTempSchedule(t); }}
+                    style={{ width: 90, padding: 6 }}
+                  />
+                  <input
+                    value={s.temp}
+                    onChange={(e) => {
+                      const t = [...tempSchedule];
+                      const n = toNumber(e.target.value);
+                      if (!Number.isNaN(n)) t[idx].temp = n;
+                      else if (e.target.value === "") t[idx].temp = "";
+                      setTempSchedule(t);
+                    }}
+                    style={{ width: 80, padding: 6 }}
+                  />
+                  <button onClick={() => removeTempPoint(idx)} style={{ padding: "6px 10px", background: "#2b3145", color: "#e6eef8", border: "1px solid #3a4566", borderRadius: 6, cursor: "pointer" }}>remover</button>
+                </div>
               ))}
-            </tbody>
-          </table>
+              <button onClick={addTempPoint} style={{ marginTop: 6, padding: "8px 12px", background: "#1f6feb", color: "white", border: 0, borderRadius: 6, cursor: "pointer" }}>
+                + Adicionar ponto
+              </button>
+            </div>
+          </div>
 
-          <div style={{ height: 220, marginTop: 12 }}>
-            <ResponsiveContainer>
-              <LineChart data={tempSeries}>
-                <XAxis dataKey="time" />
-                <YAxis domain={[10, 35]} />
-                <Tooltip />
-                <Line type="monotone" dataKey="temp" stroke="#ff6600" dot={false} name="Temp (°C)" />
-              </LineChart>
-            </ResponsiveContainer>
+          {/* Lotes */}
+          <div style={{ flex: "1 1 700px", background: "#0f1724", borderRadius: 10, padding: 12, boxShadow: "0 6px 18px rgba(2,6,23,0.6)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 600 }}>Lotes</div>
+              <div>
+                <button onClick={addBatch} disabled={batches.length >= MAX_BATCHES}
+                        style={{ padding: "8px 12px", background: batches.length >= MAX_BATCHES ? "#3a4566" : "#22c55e", color: "#0b1020", border: 0, borderRadius: 6, cursor: batches.length >= MAX_BATCHES ? "not-allowed" : "pointer" }}>
+                  + Adicionar lote
+                </button>
+              </div>
+            </div>
+
+            <div style={{ overflowX: "auto", marginTop: 8 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: "#121a2d" }}>
+                    <th style={{ padding: 8, textAlign: "left" }}>Nome</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Início</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Produto</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>% Fermento</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>%</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Restante (min)</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Alvo pronto</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Previsto</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Erro (min)</th>
+                    <th style={{ padding: 8, textAlign: "left" }}>Ações</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map((r) => (
+                    <tr key={r.id} style={{ borderBottom: "1px solid #1a2340" }}>
+                      <td style={{ padding: 8 }}>
+                        <input value={r.name} onChange={(e) => updateBatch(r.id, "name", e.target.value)} style={{ width: 140, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={r.start} onChange={(e) => updateBatch(r.id, "start", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <select value={r.productKey} onChange={(e) => updateBatch(r.id, "productKey", e.target.value)} style={{ padding: 6 }}>
+                          {Object.keys(products).map((k) => (
+                            <option key={k} value={k}>{products[k].name}</option>
+                          ))}
+                        </select>
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={r.ferment_pct} onChange={(e) => updateBatch(r.id, "ferment_pct", e.target.value)} style={{ width: 80, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>{r.pct.toFixed(1)}%</td>
+                      <td style={{ padding: 8 }}>{r.estimated_time_remaining_min}</td>
+
+                      <td style={{ padding: 8 }}>
+                        <input
+                          value={r.target_ready || ""}
+                          onChange={(e) => updateBatch(r.id, "target_ready", e.target.value)}
+                          style={{ width: 90, padding: 6 }}
+                          placeholder="HH:MM"
+                        />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        {r.predicted_finish_min == null ? "—" : minutesToTime(r.predicted_finish_min)}
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        {r.error_min == null ? "—" : (r.error_min > 0 ? `+${r.error_min}` : `${r.error_min}`)}
+                      </td>
+
+                      <td style={{ padding: 8 }}>
+                        <button onClick={() => adjustStartForTarget(r.id)}
+                                style={{ marginRight: 6, padding: "6px 10px", background: "#1f6feb", color: "#fff", border: 0, borderRadius: 6, cursor: "pointer" }}>
+                          ajustar início
+                        </button>
+                        <button onClick={() => adjustFermentForTarget(r.id)}
+                                style={{ marginRight: 6, padding: "6px 10px", background: "#22c55e", color: "#0b1020", border: 0, borderRadius: 6, cursor: "pointer" }}>
+                          ajustar %fermento
+                        </button>
+                        <button onClick={() => removeBatch(r.id)}
+                                style={{ padding: "6px 10px", background: "#2b3145", color: "#e6eef8", border: "1px solid #3a4566", borderRadius: 6, cursor: "pointer" }}>
+                          remover
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ height: 240, marginTop: 12 }}>
+              <ResponsiveContainer>
+                <LineChart data={tempSeries}>
+                  <XAxis dataKey="time" />
+                  <YAxis domain={[10, 35]} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey="temp" stroke="#ff6600" dot={false} name="Temp (°C)" />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
-      <div style={{ marginTop: 12, fontSize: 13, color: '#9fb0c8' }}>
-        <strong>Como usar:</strong> edite os horários de início e as temperaturas no cronograma. Tempo mostrado em minutos. Histórico demo pré-carregado.
+      {tab === "produtos" && (
+        <div style={{ background: "#0f1724", borderRadius: 10, padding: 12, boxShadow: "0 6px 18px rgba(2,6,23,0.6)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontWeight: 600 }}>Produtos — calibração por variedade</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={exportProducts} style={{ padding: "8px 12px", background: "#2b3145", color: "#e6eef8", border: "1px solid #3a4566", borderRadius: 6, cursor: "pointer" }}>Exportar JSON</button>
+              <label style={{ padding: "8px 12px", background: "#2b3145", color: "#e6eef8", border: "1px solid #3a4566", borderRadius: 6, cursor: "pointer" }}>
+                Importar JSON
+                <input type="file" accept="application/json" onChange={(e) => e.target.files?.[0] && importProducts(e.target.files[0])} style={{ display: "none" }} />
+              </label>
+            </div>
+          </div>
+
+          <div style={{ overflowX: "auto", marginTop: 10 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ background: "#121a2d" }}>
+                  <th style={{ padding: 8, textAlign: "left" }}>Produto</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>Tempo ref (min)</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>Fermento ref (%)</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>k_temp</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>Q10</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>alpha</th>
+                  <th style={{ padding: 8, textAlign: "left" }}>corr (x)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.keys(products).map((k) => {
+                  const p = products[k];
+                  return (
+                    <tr key={k} style={{ borderBottom: "1px solid #1a2340" }}>
+                      <td style={{ padding: 8 }}>{p.name}</td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.ideal_ref_min} onChange={(e) => updateProductField(k, "ideal_ref_min", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.ferment_ref_pct} onChange={(e) => updateProductField(k, "ferment_ref_pct", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.k_temp} onChange={(e) => updateProductField(k, "k_temp", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.q10} onChange={(e) => updateProductField(k, "q10", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.alpha} onChange={(e) => updateProductField(k, "alpha", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <input value={p.corr} onChange={(e) => updateProductField(k, "corr", e.target.value)} style={{ width: 90, padding: 6 }} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ marginTop: 10, fontSize: 13, color: "#9fb0c8" }}>
+            <ul style={{ margin: 0, paddingLeft: 18 }}>
+              <li><b>Tempo ref (min)</b>: tempo “ideal” na referência T_ref = 24 °C.</li>
+              <li><b>Fermento ref (%)</b>: % usada no teste de referência do produto.</li>
+              <li><b>k_temp</b>: sensibilidade (se <b>Q10</b> = 0, usamos k_temp).</li>
+              <li><b>Q10</b>: multiplicador de velocidade a cada +10 °C (se > 0, usamos Q10).</li>
+              <li><b>alpha</b>: sensibilidade ao % de fermento (1.0 = linear; &gt;1 mais sensível; &lt;1 menos sensível).</li>
+              <li><b>corr</b>: fator de correção (ex.: 0.85 se este produto acaba 15% mais rápido).</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12, fontSize: 13, color: "#9fb0c8" }}>
+        <strong>Como usar:</strong> em <i>Produtos</i>, você pode usar <b>Q10</b> (ou deixar <b>0</b> para usar <b>k_temp</b>) e ajustar <b>alpha</b>. No <i>Painel</i>, informe <b>Início</b>, <b>% fermento</b> e, se quiser planejar por horário, o <b>Alvo pronto</b>. Use os botões para ajustar início ou % de fermento automaticamente para bater o alvo.
       </div>
     </div>
   );
